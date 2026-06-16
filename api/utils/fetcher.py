@@ -8,30 +8,40 @@ import csv
 import os
 
 def load_local_stocks():
-    """Loads all stocks from stocks.csv and returns a dict mapping ticker -> stock_dict."""
+    """Loads all stocks from stocks.csv, seeds the database if empty, and returns stocks from SQLite."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     csv_path = os.path.join(base_dir, 'stocks.csv')
-    stocks = {}
-    if not os.path.exists(csv_path):
-        return stocks
-    with open(csv_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ticker = row['ticker']
-            stocks[ticker] = {
-                'ticker': ticker,
-                'company': row['company'],
-                'sector': row['sector'],
-                'market_cap': float(row['market_cap']),
-                'pe_ratio': float(row['pe_ratio']),
-                'volatility': float(row['volatility']),
-                'week_52_high': float(row['week_52_high']),
-                'week_52_low': float(row['week_52_low']),
-                'avg_volume': float(row['avg_volume']),
-                'current_price': (float(row['week_52_high']) + float(row['week_52_low'])) / 2.0,
-                'market': row['market']
-            }
-    return stocks
+    csv_stocks = {}
+    if os.path.exists(csv_path):
+        with open(csv_path, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ticker = row['ticker']
+                csv_stocks[ticker] = {
+                    'ticker': ticker,
+                    'company': row['company'],
+                    'sector': row['sector'],
+                    'market_cap': float(row['market_cap']),
+                    'pe_ratio': float(row['pe_ratio']),
+                    'volatility': float(row['volatility']),
+                    'week_52_high': float(row['week_52_high']),
+                    'week_52_low': float(row['week_52_low']),
+                    'avg_volume': float(row['avg_volume']),
+                    'current_price': (float(row['week_52_high']) + float(row['week_52_low'])) / 2.0,
+                    'market': row['market']
+                }
+                
+    # Sync and load from SQLite database
+    try:
+        from api.database import db_seed_stocks_if_empty, db_load_stocks
+        db_seed_stocks_if_empty(csv_stocks)
+        db_stocks = db_load_stocks()
+        if db_stocks:
+            return db_stocks
+    except Exception as e:
+        print(f"Warning: Database sync failed, using static CSV fallback: {e}")
+        
+    return csv_stocks
 
 def fetch_live_stock(ticker, local_fallback):
     """Fetches live stock data using yfinance, falling back to local data if unavailable."""
@@ -121,37 +131,53 @@ def fetch_history(ticker, fallback_price, fallback_vol):
     return [{'date': (today - datetime.timedelta(days=i)).strftime('%Y-%m-%d'), 'price': float(p)} 
             for i, p in enumerate(reversed(prices))][::-1]
 
-def update_csv_stock(ticker, updated_data):
-    """Updates a single stock's metrics in stocks.csv."""
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    csv_path = os.path.join(base_dir, 'stocks.csv')
-    if not os.path.exists(csv_path):
-        return
+import threading
+
+csv_lock = threading.Lock()
+
+def update_db_stock(ticker, updated_data):
+    """Updates a single stock's metrics in the SQLite database and tries to sync with stocks.csv locally."""
+    # 1. Update SQLite (primary cache)
+    try:
+        from api.database import db_update_stock
+        db_update_stock(ticker, updated_data)
+    except Exception as e:
+        print(f"Warning: Failed to update stock in SQLite database: {e}")
         
-    stocks = []
-    fieldnames = ['ticker', 'company', 'sector', 'market_cap', 'pe_ratio', 'volatility', 'week_52_high', 'week_52_low', 'avg_volume', 'market']
-    
-    with open(csv_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row['ticker'] == ticker:
-                row['company'] = updated_data.get('company', row['company'])
-                row['sector'] = updated_data.get('sector', sector_map := updated_data.get('sector', row['sector']))
-                row['market_cap'] = str(updated_data.get('market_cap', row['market_cap']))
-                row['pe_ratio'] = str(updated_data.get('pe_ratio', row['pe_ratio']))
-                row['volatility'] = str(updated_data.get('volatility', row['volatility']))
+    # 2. Try to update CSV locally (fails silently on read-only environments like Vercel)
+    with csv_lock:
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            csv_path = os.path.join(base_dir, 'stocks.csv')
+            if not os.path.exists(csv_path):
+                return
                 
-                high = updated_data.get('week_52_high', row['week_52_high'])
-                row['week_52_high'] = f"{high:.2f}" if isinstance(high, float) else str(high)
-                
-                low = updated_data.get('week_52_low', row['week_52_low'])
-                row['week_52_low'] = f"{low:.2f}" if isinstance(low, float) else str(low)
-                
-                row['avg_volume'] = str(updated_data.get('avg_volume', row['avg_volume']))
-            stocks.append(row)
+            stocks = []
+            fieldnames = ['ticker', 'company', 'sector', 'market_cap', 'pe_ratio', 'volatility', 'week_52_high', 'week_52_low', 'avg_volume', 'market']
             
-    with open(csv_path, mode='w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(stocks)
+            with open(csv_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['ticker'] == ticker:
+                        row['company'] = updated_data.get('company', row['company'])
+                        row['sector'] = updated_data.get('sector', updated_data.get('sector', row['sector']))
+                        row['market_cap'] = str(updated_data.get('market_cap', row['market_cap']))
+                        row['pe_ratio'] = str(updated_data.get('pe_ratio', row['pe_ratio']))
+                        row['volatility'] = str(updated_data.get('volatility', row['volatility']))
+                        
+                        high = updated_data.get('week_52_high', row['week_52_high'])
+                        row['week_52_high'] = f"{high:.2f}" if isinstance(high, float) else str(high)
+                        
+                        low = updated_data.get('week_52_low', row['week_52_low'])
+                        row['week_52_low'] = f"{low:.2f}" if isinstance(low, float) else str(low)
+                        
+                        row['avg_volume'] = str(updated_data.get('avg_volume', row['avg_volume']))
+                    stocks.append(row)
+                    
+            with open(csv_path, mode='w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(stocks)
+        except Exception:
+            pass
 

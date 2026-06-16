@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from api.utils.fetcher import load_local_stocks, fetch_live_stock, fetch_history, update_csv_stock
+from api.utils.fetcher import load_local_stocks, fetch_live_stock, fetch_history, update_db_stock
 from api.ai.preprocessor import get_bounds, extract_recommender_features, extract_predictor_features, min_max_scale
 from api.ai.recommender import recommend
 from api.ai.predictor import generate_synthetic_training_data, get_prediction
@@ -26,41 +26,68 @@ CORS(app)
 # Initialize database on application startup
 init_db()
 
+from concurrent.futures import ThreadPoolExecutor
+
+def process_single_recommendation(rec, min_vals, max_vals, X_train, y_train, session_id):
+    """Processes a single recommendation's live query, prediction, and database logging."""
+    local_stock = rec['stock']
+    ticker = local_stock['ticker']
+    
+    # Fetch live/real-time data for the chosen recommended stock
+    stock = fetch_live_stock(ticker, local_stock)
+    
+    # Save the live metrics back to SQLite in real-time
+    update_db_stock(ticker, stock)
+    
+    history = fetch_history(ticker, stock['current_price'], stock['volatility'])
+    raw_feat = extract_predictor_features(stock, history)
+    
+    scaled_feat = min_max_scale(raw_feat, min_vals, max_vals)
+    trend, confidence = get_prediction(scaled_feat, X_train, y_train)
+    
+    save_recommendation(session_id, ticker, rec['match_score'], trend)
+    return {
+        'ticker': ticker,
+        'company': stock['company'],
+        'sector': stock['sector'],
+        'current_price': stock['current_price'],
+        'match_score': rec['match_score'],
+        'prediction': trend,
+        'confidence': confidence,
+        'market': stock['market']
+    }
+
 def process_recommendations(recs, all_stocks, X_train, y_train, session_id):
-    """Processes recommendations by computing scaling bounds, predicting trends, and saving records."""
+    """Processes recommendations by computing scaling bounds, predicting trends, and saving records in parallel."""
     raw_feats = [extract_predictor_features(s, []) for s in all_stocks]
     raw_feats = np.array(raw_feats)
     min_vals = np.min(raw_feats, axis=0)
     max_vals = np.max(raw_feats, axis=0)
     
     results = []
-    for rec in recs:
-        local_stock = rec['stock']
-        ticker = local_stock['ticker']
+    # Fetch stock metrics and run predictions concurrently to avoid web app timeouts
+    with ThreadPoolExecutor(max_workers=max(1, len(recs))) as executor:
+        futures = {
+            executor.submit(
+                process_single_recommendation, 
+                rec, min_vals, max_vals, X_train, y_train, session_id
+            ): rec for rec in recs
+        }
         
-        # Fetch live/real-time data for the chosen recommended stock
-        stock = fetch_live_stock(ticker, local_stock)
-        
-        # Save the live metrics back to stocks.csv in real-time
-        update_csv_stock(ticker, stock)
-        
-        history = fetch_history(ticker, stock['current_price'], stock['volatility'])
-        raw_feat = extract_predictor_features(stock, history)
-        
-        scaled_feat = min_max_scale(raw_feat, min_vals, max_vals)
-        trend, confidence = get_prediction(scaled_feat, X_train, y_train)
-        
-        save_recommendation(session_id, ticker, rec['match_score'], trend)
-        results.append({
-            'ticker': ticker,
-            'company': stock['company'],
-            'sector': stock['sector'],
-            'current_price': stock['current_price'],
-            'match_score': rec['match_score'],
-            'prediction': trend,
-            'confidence': confidence,
-            'market': stock['market']
-        })
+        results_map = {}
+        for future in futures:
+            try:
+                res = future.result()
+                results_map[res['ticker']] = res
+            except Exception as e:
+                print(f"Error processing stock in parallel: {e}")
+                
+        # Reconstruct list to maintain similarity ranking order
+        for rec in recs:
+            ticker = rec['stock']['ticker']
+            if ticker in results_map:
+                results.append(results_map[ticker])
+                
     return results
 
 def get_ai_explanation(stock, session_id):

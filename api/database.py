@@ -50,6 +50,21 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS stocks (
+                ticker TEXT PRIMARY KEY,
+                company TEXT,
+                sector TEXT,
+                market_cap REAL,
+                pe_ratio REAL,
+                volatility REAL,
+                week_52_high REAL,
+                week_52_low REAL,
+                avg_volume REAL,
+                current_price REAL,
+                market TEXT
+            )
+        ''')
         conn.commit()
 
 def save_session(session_id, risk_level, budget, sector, market):
@@ -90,5 +105,65 @@ def clear_history(session_id):
     """Deletes all recommendations for a given session ID."""
     with get_connection() as conn:
         conn.execute('DELETE FROM recommendations WHERE session_id = ?', (session_id,))
+        conn.commit()
+
+def db_seed_stocks_if_empty(csv_stocks):
+    """Seeds the stocks table from the baseline stocks if it is currently empty."""
+    with get_connection() as conn:
+        cursor = conn.execute('SELECT COUNT(*) FROM stocks')
+        count = cursor.fetchone()[0]
+        if count == 0:
+            conn.executemany('''
+                INSERT INTO stocks (
+                    ticker, company, sector, market_cap, pe_ratio,
+                    volatility, week_52_high, week_52_low, avg_volume,
+                    current_price, market
+                ) VALUES (
+                    :ticker, :company, :sector, :market_cap, :pe_ratio,
+                    :volatility, :week_52_high, :week_52_low, :avg_volume,
+                    :current_price, :market
+                )
+            ''', list(csv_stocks.values()))
+            conn.commit()
+
+def db_load_stocks():
+    """Loads all stocks from the SQLite database."""
+    with get_connection() as conn:
+        cursor = conn.execute('SELECT * FROM stocks')
+        stocks = {}
+        for row in cursor.fetchall():
+            s = dict(row)
+            stocks[s['ticker']] = s
+        return stocks
+
+def db_update_stock(ticker, updated_data):
+    """Updates a single stock's metrics in the SQLite database."""
+    with get_connection() as conn:
+        conn.execute('''
+            UPDATE stocks SET
+                company = COALESCE(?, company),
+                sector = COALESCE(?, sector),
+                market_cap = COALESCE(?, market_cap),
+                pe_ratio = COALESCE(?, pe_ratio),
+                volatility = COALESCE(?, volatility),
+                week_52_high = COALESCE(?, week_52_high),
+                week_52_low = COALESCE(?, week_52_low),
+                avg_volume = COALESCE(?, avg_volume),
+                current_price = COALESCE(?, current_price),
+                market = COALESCE(?, market)
+            WHERE ticker = ?
+        ''', (
+            updated_data.get('company'),
+            updated_data.get('sector'),
+            updated_data.get('market_cap'),
+            updated_data.get('pe_ratio'),
+            updated_data.get('volatility'),
+            updated_data.get('week_52_high'),
+            updated_data.get('week_52_low'),
+            updated_data.get('avg_volume'),
+            updated_data.get('current_price'),
+            updated_data.get('market'),
+            ticker
+        ))
         conn.commit()
 
